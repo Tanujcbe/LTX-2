@@ -84,8 +84,8 @@ class AVGemmaTextEncoderModelConfigurator(ModelConfigurator[AVGemmaTextEncoderMo
         embeddings_connector = Embeddings1DConnectorConfigurator.from_config(config)
         audio_embeddings_connector = Embeddings1DConnectorConfigurator.from_config(config)
         gemma_config = Gemma3Config.from_dict(GEMMA3_CONFIG_FOR_LTX.to_dict())
-        with torch.device("meta"):
-            model = Gemma3ForConditionalGeneration(gemma_config)
+        with torch.device("cpu"):
+            model = Gemma3ForConditionalGeneration(gemma_config).to(dtype=torch.bfloat16)
         return AVGemmaTextEncoderModel(
             model=model,
             feature_extractor_linear=feature_extractor_linear,
@@ -130,17 +130,43 @@ def create_and_populate(module: AVGemmaTextEncoderModel) -> AVGemmaTextEncoderMo
 
     config = model.config.text_config
     dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    base = config.rope_local_base_freq
+    base = getattr(config, "rope_local_base_freq", 10000)
     local_rope_freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(dtype=torch.float) / dim))
-    inv_freqs, _ = ROPE_INIT_FUNCTIONS[config.rope_scaling["rope_type"]](config)
+    rope_scaling = config.rope_scaling
+    if not isinstance(rope_scaling, dict):
+        if hasattr(rope_scaling, "to_dict"):
+            rope_scaling = rope_scaling.to_dict()
+        elif hasattr(rope_scaling, "__dict__"):
+            rope_scaling = rope_scaling.__dict__
+        else:
+            rope_scaling = {"rope_type": "linear", "factor": 8.0}
+        # Update config.rope_scaling because transformers function reads it from config
+        config.rope_scaling = rope_scaling
+
+    rope_type = rope_scaling.get("rope_type", "linear")
+    if rope_type is None:
+        rope_type = "linear"
+
+    if "factor" not in rope_scaling:
+        rope_scaling["factor"] = 8.0
+
+    if not hasattr(config, "rope_theta") or config.rope_theta is None:
+        config.rope_theta = 1000000
+
+    inv_freqs, _ = ROPE_INIT_FUNCTIONS[rope_type](config)
 
     positions_length = len(v_model.embeddings.position_ids[0])
     position_ids = torch.arange(positions_length, dtype=torch.long, device="cpu").unsqueeze(0)
     v_model.embeddings.register_buffer("position_ids", position_ids)
     embed_scale = torch.tensor(model.config.text_config.hidden_size**0.5, device="cpu")
     l_model.embed_tokens.register_buffer("embed_scale", embed_scale)
-    l_model.rotary_emb_local.register_buffer("inv_freq", local_rope_freqs)
-    l_model.rotary_emb.register_buffer("inv_freq", inv_freqs)
+    if hasattr(l_model, "rotary_emb_local"):
+        l_model.rotary_emb_local.register_buffer("inv_freq", local_rope_freqs)
+    else:
+        print(f"Warning: rotary_emb_local not found in l_model. Available keys: {dir(l_model)}")
+
+    if hasattr(l_model, "rotary_emb"):
+        l_model.rotary_emb.register_buffer("inv_freq", inv_freqs)
 
     return module
 
